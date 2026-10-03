@@ -22,10 +22,22 @@
   доставка, тем ниже оценка.
 - ``returned`` — был ли возврат (True/False). Вероятность возврата
   зависит от категории.
+- ``check_raw`` — сумма заказа так, как её записала система. Совпадает
+  с ``check``, кроме записей с аномалиями (урок 5.2).
+- ``anomaly`` — что на самом деле случилось с записью (в жизни неизвестно):
+  ``none`` — обычный заказ; ``zero`` — тестовый заказ / сбой, сумма 0;
+  ``kopecks`` — сумма записана в копейках (×100); ``b2b`` — оптовый заказ
+  юрлица: реальный, но из другого процесса (×20…×100 к обычному чеку).
 
-Поля появляются по мере надобности в уроках. У каждого поля свой поток
-случайных чисел (``_streams``), поэтому новое поле не меняет уже
-существующие при том же seed. Новый поток добавлять только в конец ``FIELDS``.
+Поля появляются по мере надобности в уроках. Случайность разбита на
+независимые потоки (``FIELDS`` — имена потоков, не колонок; ``_streams``),
+поэтому новый поток не меняет уже существующие колонки при том же seed.
+Правила, чтобы не сдвинуть старые данные:
+- новый поток добавлять только в конец ``FIELDS``;
+- внутри существующего потока порядок вызовов не менять, новые вызовы — в конец;
+- производная колонка (``check_raw``) строится из готовых значений и своего
+  потока не имеет.
+Тесты ``tests/test_marketplace.py`` фиксируют эталон каждой колонки.
 """
 
 from dataclasses import dataclass
@@ -65,8 +77,11 @@ REGIONS: dict[str, tuple[float, int]] = {
 N_ORDERS = 1_000_000
 SEED = 42
 
-# порядок задаёт номер потока: дописывать только в конец
-FIELDS = ("category", "check", "device", "region", "delivery_days", "rating", "returned")
+# имена потоков случайности; порядок задаёт номер потока: дописывать только в конец
+FIELDS = ("category", "check", "device", "region", "delivery_days", "rating", "returned", "anomaly")
+
+# тип аномалии: вероятность (урок 5.2). Порядок — коды Categorical, не менять.
+ANOMALIES: dict[str, float] = {"none": 0.990, "zero": 0.002, "kopecks": 0.003, "b2b": 0.005}
 
 
 def _streams(seed: int) -> dict[str, np.random.Generator]:
@@ -107,6 +122,17 @@ def make_population(n_orders: int = N_ORDERS, seed: int = SEED) -> pd.DataFrame:
     p_return = np.array([c.p_return for c in cats])[cat_idx]
     returned = rng["returned"].random(n_orders) < p_return
 
+    an_rng = rng["anomaly"]
+    an_code = {name: i for i, name in enumerate(ANOMALIES)}
+    an_idx = an_rng.choice(len(an_code), size=n_orders, p=list(ANOMALIES.values()))
+    is_b2b = an_idx == an_code["b2b"]
+    b2b_factor = an_rng.uniform(20, 100, size=int(is_b2b.sum()))
+    check_raw = check.copy()
+    check_raw[an_idx == an_code["zero"]] = 0.0
+    is_kop = an_idx == an_code["kopecks"]
+    check_raw[is_kop] = np.rint(check[is_kop] * 100)  # рубли·100 = целые копейки
+    check_raw[is_b2b] = (check[is_b2b] * b2b_factor).round(2)
+
     return pd.DataFrame(
         {
             "order_id": np.arange(1, n_orders + 1),
@@ -117,5 +143,7 @@ def make_population(n_orders: int = N_ORDERS, seed: int = SEED) -> pd.DataFrame:
             "delivery_days": delivery_days,
             "rating": rating,
             "returned": returned,
+            "check_raw": check_raw,
+            "anomaly": pd.Categorical.from_codes(an_idx, list(ANOMALIES)),
         }
     )
